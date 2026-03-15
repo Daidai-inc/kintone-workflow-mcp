@@ -3,6 +3,9 @@
  * APIトークン認証 / パスワード認証に対応
  */
 
+import path from "path";
+import os from "os";
+
 export interface KintoneConfig {
   baseUrl: string; // https://example.cybozu.com
   auth:
@@ -416,26 +419,130 @@ export class KintoneClient {
     return res as { id: string };
   }
 
+  // --- アプリ詳細 ---
+
+  /** アプリ1件の詳細情報取得 */
+  async getApp(appId: number): Promise<Record<string, unknown>> {
+    const res = await this.request("GET", `/k/v1/app.json?id=${appId}`);
+    return res;
+  }
+
+  /** プロセス管理設定取得 */
+  async getProcessStatus(appId: number): Promise<Record<string, unknown>> {
+    const res = await this.request("GET", `/k/v1/app/status.json?app=${appId}`);
+    return res;
+  }
+
+  /** 作業者変更 */
+  async updateAssignees(
+    appId: number,
+    recordId: number,
+    assignees: string[]
+  ): Promise<{ revision: string }> {
+    const res = await this.request("PUT", "/k/v1/record/assignees.json", {
+      app: appId,
+      id: recordId,
+      assignees,
+    });
+    return res as { revision: string };
+  }
+
+  /** 複数レコードのステータス一括更新 */
+  async bulkUpdateStatuses(
+    appId: number,
+    records: { id: number; action: string; assignee?: string }[]
+  ): Promise<{ records: { id: string; revision: string }[] }> {
+    const res = await this.request("PUT", "/k/v1/records/status.json", {
+      app: appId,
+      records: records.map((r) => ({
+        id: r.id,
+        action: r.action,
+        ...(r.assignee ? { assignee: r.assignee } : {}),
+      })),
+    });
+    return res as { records: { id: string; revision: string }[] };
+  }
+
+  /** 複数APIリクエストを一括実行（トランザクション的） */
+  async bulkRequest(
+    requests: { method: string; api: string; payload: unknown }[]
+  ): Promise<{ results: unknown[] }> {
+    const res = await this.request("POST", "/k/v1/bulkRequest.json", {
+      requests: requests.map((r) => ({
+        method: r.method,
+        api: `/k/v1/${r.api}`,
+        payload: r.payload,
+      })),
+    });
+    return res as { results: unknown[] };
+  }
+
+  // --- カーソルAPI ---
+
+  /** カーソル作成 */
+  async createCursor(
+    appId: number,
+    query?: string,
+    fields?: string[]
+  ): Promise<{ id: string; totalCount: string }> {
+    const body: Record<string, unknown> = { app: appId };
+    if (query) body.query = query;
+    if (fields) body.fields = fields;
+    const res = await this.request("POST", "/k/v1/records/cursor.json", body);
+    return res as { id: string; totalCount: string };
+  }
+
+  /** カーソルからレコード取得 */
+  async getRecordsByCursor(
+    cursorId: string
+  ): Promise<{ records: KintoneRecord[]; next: boolean }> {
+    const res = await this.request(
+      "GET",
+      `/k/v1/records/cursor.json?id=${encodeURIComponent(cursorId)}`
+    );
+    return res as { records: KintoneRecord[]; next: boolean };
+  }
+
+  /** カーソル削除 */
+  async deleteCursor(cursorId: string): Promise<void> {
+    await this.request("DELETE", "/k/v1/records/cursor.json", {
+      id: cursorId,
+    });
+  }
+
   // --- 集計用ヘルパー ---
 
-  /** 全レコード取得（500件制限を超えて自動ページング） */
+  /** 全レコード取得（カーソルAPIで10,000件超対応） */
   async getAllRecords(
     appId: number,
     query?: string,
     fields?: string[]
   ): Promise<KintoneRecord[]> {
-    const allRecords: KintoneRecord[] = [];
-    let offset = 0;
-    const limit = 500;
+    let cursorId: string | undefined;
+    try {
+      const cursor = await this.createCursor(appId, query, fields);
+      cursorId = cursor.id;
+      const allRecords: KintoneRecord[] = [];
 
-    while (true) {
-      const result = await this.getRecords(appId, query, fields, limit, offset);
-      allRecords.push(...result.records);
-      if (result.records.length < limit) break;
-      offset += limit;
-      if (offset >= 10000) break; // kintone offset上限
+      while (true) {
+        const result = await this.getRecordsByCursor(cursorId);
+        allRecords.push(...result.records);
+        if (!result.next) break;
+      }
+      // カーソルは全件取得後に自動削除されるが、念のため
+      cursorId = undefined;
+      return allRecords;
+    } catch (e) {
+      // エラー時はカーソルをクリーンアップ
+      if (cursorId) {
+        try {
+          await this.deleteCursor(cursorId);
+        } catch {
+          // クリーンアップ失敗は無視
+        }
+      }
+      throw e;
     }
-    return allRecords;
   }
 
   // --- スキーマ取得 ---
@@ -462,34 +569,112 @@ export class KintoneClient {
     return descriptions;
   }
 
+  // --- パス検証ヘルパー ---
+
+  /** ファイルパスが許可ディレクトリ内かを検証する */
+  static validateFilePath(filePath: string): string {
+    const resolved = path.resolve(filePath);
+    const homeDir = os.homedir();
+    const tmpDir = os.tmpdir();
+    const allowedPrefixes = [tmpDir, "/tmp", homeDir];
+
+    const isAllowed = allowedPrefixes.some((prefix) =>
+      resolved.startsWith(prefix + path.sep) || resolved === prefix
+    );
+    if (!isAllowed) {
+      throw new Error(
+        `セキュリティエラー: ファイルパス "${resolved}" は許可されたディレクトリ（/tmp または HOME配下）の外です`
+      );
+    }
+    return resolved;
+  }
+
+  /** クエリ値のエスケープ（ダブルクォート） */
+  static escapeQueryValue(value: string): string {
+    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
   // --- 内部メソッド ---
 
   private async request(
     method: string,
-    path: string,
+    apiPath: string,
     body?: unknown
   ): Promise<KintoneResponse> {
-    const url = `${this.baseUrl}${path}`;
+    const url = `${this.baseUrl}${apiPath}`;
     const headers = { ...this.headers };
     // GETリクエストではContent-Typeを送らない（kintone APIが400を返す）
     if (method === "GET") {
       delete headers["Content-Type"];
     }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
     const options: RequestInit = {
       method,
       headers,
+      signal: controller.signal,
     };
     if (body && (method === "POST" || method === "PUT" || method === "DELETE")) {
       options.body = JSON.stringify(body);
     }
 
-    const response = await fetch(url, options);
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(
-        `kintone API error: ${response.status} ${response.statusText}\n${errorBody}`
+    const startTime = Date.now();
+    try {
+      const response = await fetch(url, options);
+      clearTimeout(timeoutId);
+      const elapsed = Date.now() - startTime;
+
+      // 監査ログ出力（stderrへJSON）
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          method,
+          path: apiPath.split("?")[0],
+          status: response.status,
+          elapsed_ms: elapsed,
+        })
       );
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(
+          `kintone API error: ${response.status} ${response.statusText}\n${errorBody}`
+        );
+      }
+      return (await response.json()) as KintoneResponse;
+    } catch (e) {
+      clearTimeout(timeoutId);
+      const elapsed = Date.now() - startTime;
+
+      // タイムアウト判定
+      if (e instanceof DOMException && e.name === "AbortError") {
+        console.error(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            method,
+            path: apiPath.split("?")[0],
+            status: "error",
+            elapsed_ms: elapsed,
+          })
+        );
+        throw new Error(
+          `kintone APIタイムアウト（30秒）: ${method} ${apiPath.split("?")[0]}`
+        );
+      }
+
+      // その他のエラーでも監査ログを出力
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          method,
+          path: apiPath.split("?")[0],
+          status: "error",
+          elapsed_ms: elapsed,
+        })
+      );
+      throw e;
     }
-    return (await response.json()) as KintoneResponse;
   }
 }

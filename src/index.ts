@@ -332,7 +332,7 @@ server.tool(
 
     for (let i = 0; i < keyValues.length; i += chunkSize) {
       const chunk = keyValues.slice(i, i + chunkSize);
-      const conditions = chunk.map(v => `${target_key_field} = "${v}"`).join(" or ");
+      const conditions = chunk.map(v => `${target_key_field} = "${KintoneClient.escapeQueryValue(v)}"`).join(" or ");
       const targetRecords = await client.getAllRecords(target_app_id, conditions, target_fields);
       allTargetRecords.push(...targetRecords);
     }
@@ -652,7 +652,8 @@ server.tool(
     file_name: z.string().optional().describe("kintone上でのファイル名（省略時はファイル名をそのまま使用）"),
   },
   async ({ file_path, file_name }) => {
-    const result = await client.uploadFile(file_path, file_name);
+    const safePath = KintoneClient.validateFilePath(file_path);
+    const result = await client.uploadFile(safePath, file_name);
     return {
       content: [{ type: "text" as const, text: `ファイルアップロード完了\nfileKey: ${result.fileKey}\n\nこのfileKeyをレコードの添付ファイルフィールドに設定してください。\n例: create_record(app_id, { "添付ファイル": { value: [{ fileKey: "${result.fileKey}" }] } })` }],
     };
@@ -668,11 +669,12 @@ server.tool(
     save_path: z.string().describe("保存先のファイルパス（例: '/tmp/downloaded_file.pdf'）"),
   },
   async ({ file_key, save_path }) => {
+    const safePath = KintoneClient.validateFilePath(save_path);
     const fs = await import("fs");
     const data = await client.downloadFile(file_key);
-    fs.writeFileSync(save_path, Buffer.from(data));
+    fs.writeFileSync(safePath, Buffer.from(data));
     return {
-      content: [{ type: "text" as const, text: `ファイルダウンロード完了: ${save_path}（${data.byteLength}バイト）` }],
+      content: [{ type: "text" as const, text: `ファイルダウンロード完了: ${safePath}（${data.byteLength}バイト）` }],
     };
   }
 );
@@ -1011,24 +1013,111 @@ server.tool(
     const csvContent = lines.join("\n");
 
     if (save_path) {
+      const validatedSavePath = KintoneClient.validateFilePath(save_path);
       const fs = await import("fs");
       if (encoding === "sjis") {
         // Shift_JISは非対応（Node.jsネイティブでは難しい）のでUTF-8 BOM付きで保存
         const bom = Buffer.from([0xEF, 0xBB, 0xBF]);
         const content = Buffer.from(csvContent, "utf-8");
-        fs.writeFileSync(save_path, Buffer.concat([bom, content]));
+        fs.writeFileSync(validatedSavePath, Buffer.concat([bom, content]));
       } else {
         const bom = Buffer.from([0xEF, 0xBB, 0xBF]);
         const content = Buffer.from(csvContent, "utf-8");
-        fs.writeFileSync(save_path, Buffer.concat([bom, content]));
+        fs.writeFileSync(validatedSavePath, Buffer.concat([bom, content]));
       }
       return {
-        content: [{ type: "text" as const, text: `CSV出力完了: ${save_path}\n${records.length}件のレコードをエクスポートしました` }],
+        content: [{ type: "text" as const, text: `CSV出力完了: ${validatedSavePath}\n${records.length}件のレコードをエクスポートしました` }],
       };
     }
 
     return {
       content: [{ type: "text" as const, text: `CSV出力（${records.length}件）:\n\n${csvContent}` }],
+    };
+  }
+);
+
+// --- アプリ詳細取得 ---
+server.tool(
+  "get_app_detail",
+  "kintoneアプリ1件の詳細情報を取得する。アプリ名、作成者、スペースID、説明等を確認できる。例: 「このアプリの管理者は誰？」「アプリの説明を見せて」",
+  {
+    app_id: z.number().describe("アプリID"),
+  },
+  async ({ app_id }) => {
+    const app = await client.getApp(app_id);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(app, null, 2) }],
+    };
+  }
+);
+
+// --- プロセス管理設定取得 ---
+server.tool(
+  "get_process_settings",
+  "kintoneアプリのプロセス管理（ワークフロー）設定を取得する。ステータス一覧、遷移条件、各ステータスの作業者を確認できる。例: 「この案件の承認フローはどうなってる？」「どんなステータスがある？」",
+  {
+    app_id: z.number().describe("アプリID"),
+  },
+  async ({ app_id }) => {
+    const status = await client.getProcessStatus(app_id);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(status, null, 2) }],
+    };
+  }
+);
+
+// --- 作業者変更 ---
+server.tool(
+  "update_assignees",
+  "kintoneレコードのプロセス管理の作業者を変更する。ステータスは変えずに担当者だけ変更したい場合に使う。例: 「この案件の担当を田中さんに変えて」「作業者を佐藤さんと鈴木さんにして」",
+  {
+    app_id: z.number().describe("アプリID"),
+    record_id: z.number().describe("レコードID"),
+    assignees: z.array(z.string()).describe("新しい作業者のログイン名の配列（例: ['tanaka', 'suzuki']）"),
+  },
+  async ({ app_id, record_id, assignees }) => {
+    const result = await client.updateAssignees(app_id, record_id, assignees);
+    return {
+      content: [{ type: "text" as const, text: `作業者変更完了: レコード${record_id}の作業者を[${assignees.join(", ")}]に変更しました（revision: ${result.revision}）` }],
+    };
+  }
+);
+
+// --- ステータス一括更新 ---
+server.tool(
+  "bulk_update_statuses",
+  "複数レコードのプロセス管理ステータスを一括更新する。例: 「未処理の案件を全部承認して」「選択した5件をまとめて差し戻して」",
+  {
+    app_id: z.number().describe("アプリID"),
+    records: z.array(z.object({
+      id: z.number().describe("レコードID"),
+      action: z.string().describe("実行するアクション名（例: '承認する'）"),
+      assignee: z.string().optional().describe("次の作業者のログイン名"),
+    })).describe("ステータス更新対象の配列"),
+  },
+  async ({ app_id, records }) => {
+    const result = await client.bulkUpdateStatuses(app_id, records);
+    return {
+      content: [{ type: "text" as const, text: `ステータス一括更新完了: ${result.records.length}件のレコードを更新しました` }],
+    };
+  }
+);
+
+// --- バルクリクエスト ---
+server.tool(
+  "bulk_request",
+  "複数のkintone API操作をまとめて実行する（トランザクション的）。1つでも失敗すると全てロールバックされる。例: 「レコード作成してからステータスを変更する」をアトミックに実行",
+  {
+    requests: z.array(z.object({
+      method: z.enum(["GET", "POST", "PUT", "DELETE"]).describe("HTTPメソッド"),
+      api: z.string().describe("APIエンドポイント（k/v1/以降。例: 'record.json'）"),
+      payload: z.unknown().describe("リクエストボディ"),
+    })).describe("実行するAPIリクエストの配列（最大20件）"),
+  },
+  async ({ requests }) => {
+    const result = await client.bulkRequest(requests);
+    return {
+      content: [{ type: "text" as const, text: `バルクリクエスト完了: ${result.results.length}件の操作を実行しました\n\n${JSON.stringify(result.results, null, 2)}` }],
     };
   }
 );
