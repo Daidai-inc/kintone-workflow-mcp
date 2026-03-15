@@ -46,8 +46,8 @@ server.tool(
   "get_record",
   "kintoneのレコードを1件取得する",
   {
-    app_id: z.number().describe("アプリID"),
-    record_id: z.number().describe("レコードID"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
   },
   async ({ app_id, record_id }) => {
     const record = await client.getRecord(app_id, record_id);
@@ -60,7 +60,7 @@ server.tool(
   "search_records",
   "kintoneのレコードをクエリで検索する。クエリ構文: https://cybozu.dev/ja/kintone/docs/overview/query/",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     query: z.string().optional().describe("検索クエリ（例: 'ステータス in (\"未着手\") order by 更新日時 desc'）"),
     fields: z.array(z.string()).optional().describe("取得するフィールドコードの配列"),
     limit: z.number().optional().default(100).describe("取得件数（最大500）"),
@@ -81,7 +81,7 @@ server.tool(
   "create_record",
   "kintoneにレコードを1件作成する",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     record: z.record(z.string(), z.object({ value: z.unknown() })).describe("フィールドコードと値のオブジェクト"),
   },
   async ({ app_id, record }) => {
@@ -97,8 +97,8 @@ server.tool(
   "update_record",
   "kintoneのレコードを1件更新する",
   {
-    app_id: z.number().describe("アプリID"),
-    record_id: z.number().describe("レコードID"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
     record: z.record(z.string(), z.object({ value: z.unknown() })).describe("更新するフィールドコードと値のオブジェクト"),
     revision: z.number().optional().describe("楽観ロック用リビジョン番号（省略時はロックなし）"),
   },
@@ -115,10 +115,16 @@ server.tool(
   "delete_records",
   "kintoneのレコードを削除する（複数件対応）",
   {
-    app_id: z.number().describe("アプリID"),
-    record_ids: z.array(z.number()).describe("削除するレコードIDの配列（最大100件）"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_ids: z.array(z.number().int().positive()).max(100).describe("削除するレコードIDの配列（最大100件）"),
+    dry_run: z.boolean().optional().default(false).describe("trueにすると削除対象の確認のみ行い、実際の削除は行わない"),
   },
-  async ({ app_id, record_ids }) => {
+  async ({ app_id, record_ids, dry_run }) => {
+    if (dry_run) {
+      return {
+        content: [{ type: "text" as const, text: `以下の${record_ids.length}件が削除されます: ID=${record_ids.join(",")}` }],
+      };
+    }
     await client.deleteRecords(app_id, record_ids);
     return {
       content: [{ type: "text" as const, text: `${record_ids.length}件のレコードを削除しました` }],
@@ -131,12 +137,16 @@ server.tool(
   "add_comment",
   "kintoneレコードにコメントを追加する",
   {
-    app_id: z.number().describe("アプリID"),
-    record_id: z.number().describe("レコードID"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
     text: z.string().describe("コメント本文"),
+    mentions: z.array(z.object({
+      code: z.string().describe("メンション対象のコード（ログイン名等）"),
+      type: z.enum(["USER", "GROUP", "ORGANIZATION"]).describe("メンション対象の種類"),
+    })).optional().describe("メンション対象の配列"),
   },
-  async ({ app_id, record_id, text }) => {
-    const result = await client.addComment(app_id, record_id, text);
+  async ({ app_id, record_id, text, mentions }) => {
+    const result = await client.addComment(app_id, record_id, text, mentions);
     return {
       content: [{ type: "text" as const, text: `コメント追加完了: comment_id=${result.id}` }],
     };
@@ -148,8 +158,8 @@ server.tool(
   "get_comments",
   "kintoneレコードのコメント一覧を取得する",
   {
-    app_id: z.number().describe("アプリID"),
-    record_id: z.number().describe("レコードID"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
     order: z.enum(["asc", "desc"]).optional().default("desc").describe("並び順"),
     limit: z.number().optional().default(10).describe("取得件数（最大10）"),
   },
@@ -166,8 +176,8 @@ server.tool(
   "update_status",
   "kintoneレコードのプロセス管理ステータスを更新する（承認フロー等）",
   {
-    app_id: z.number().describe("アプリID"),
-    record_id: z.number().describe("レコードID"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
     action: z.string().describe("実行するアクション名（例: '承認する', '差し戻す'）"),
     assignee: z.string().optional().describe("次の作業者のログイン名"),
   },
@@ -199,7 +209,7 @@ server.tool(
   "get_form_fields",
   "kintoneアプリのフォームフィールド定義を取得する（フィールドコード、型、設定）",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
   },
   async ({ app_id }) => {
     const result = await client.getFormFields(app_id);
@@ -214,8 +224,8 @@ server.tool(
   "bulk_create_records",
   "kintoneにレコードを一括作成する（最大100件）",
   {
-    app_id: z.number().describe("アプリID"),
-    records: z.array(z.record(z.string(), z.object({ value: z.unknown() }))).describe("レコードの配列"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    records: z.array(z.record(z.string(), z.object({ value: z.unknown() }))).max(100).describe("レコードの配列（最大100件）"),
   },
   async ({ app_id, records }) => {
     const result = await client.createRecords(app_id, records as KintoneRecord[]);
@@ -230,11 +240,11 @@ server.tool(
   "bulk_update_records",
   "kintoneのレコードを一括更新する（最大100件）",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     records: z.array(z.object({
-      id: z.number().describe("レコードID"),
+      id: z.number().int().positive().describe("レコードID"),
       record: z.record(z.string(), z.object({ value: z.unknown() })).describe("更新するフィールド"),
-    })).describe("更新対象の配列"),
+    })).max(100).describe("更新対象の配列（最大100件）"),
   },
   async ({ app_id, records }) => {
     const result = await client.updateRecords(app_id, records.map(r => ({
@@ -252,7 +262,7 @@ server.tool(
   "aggregate_records",
   "kintoneのレコードを集計する。指定フィールドでグループ化し、数値フィールドを合計・平均・件数で集計。「今月の売上を部署別に集計して」等に使う",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     query: z.string().optional().describe("絞り込みクエリ（例: '登録日 >= \"2026-03-01\"'）"),
     group_by: z.string().describe("グループ化するフィールドコード（例: '部署'）"),
     aggregate_field: z.string().optional().describe("集計する数値フィールドコード（例: '金額'）"),
@@ -463,7 +473,7 @@ server.tool(
   "smart_search",
   "自然言語でkintoneを検索する。日付や条件を自動でkintoneクエリに変換する。「先月の未完了案件」「金額100万以上の案件」「田中さん担当の案件」等に使う",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     natural_query: z.string().describe("自然言語の検索条件（例: '先月の未完了案件', '金額100万以上'）"),
     sort_by: z.string().optional().describe("ソートするフィールドコード"),
     sort_order: z.enum(["asc", "desc"]).optional().default("desc").describe("ソート順"),
@@ -684,7 +694,7 @@ server.tool(
   "update_fields",
   "kintoneアプリのフィールド設定を変更する（ラベル、必須/任意、選択肢等）。プレビュー環境に反映後、自動デプロイする。例: フィールドのラベルを「氏名」→「お名前」に変更",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     properties: z.record(z.string(), z.record(z.string(), z.unknown())).describe("フィールドコードをキーとした更新内容（例: { 'name': { label: 'お名前', required: true } }）"),
     deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
   },
@@ -717,7 +727,7 @@ server.tool(
   "delete_fields",
   "kintoneアプリのフィールドを削除する。プレビュー環境に反映後、自動デプロイする。注意: 削除するとそのフィールドのデータも失われる",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     field_codes: z.array(z.string()).describe("削除するフィールドコードの配列（例: ['old_field1', 'old_field2']）"),
     deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
   },
@@ -750,7 +760,7 @@ server.tool(
   "get_views",
   "kintoneアプリのビュー（一覧）定義を取得する。フィルタ条件・表示フィールド・ソート順を確認できる",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
   },
   async ({ app_id }) => {
     const result = await client.getViews(app_id);
@@ -765,7 +775,7 @@ server.tool(
   "create_view",
   "kintoneアプリに新しいビュー（一覧）を作成する。フィルタ条件・表示フィールド・ソート順を指定可能。例: '未完了案件' ビューを作成",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     name: z.string().describe("ビュー名（例: '未完了案件一覧'）"),
     type: z.enum(["LIST", "CALENDAR", "CUSTOM"]).optional().default("LIST").describe("ビューの種類"),
     fields: z.array(z.string()).optional().describe("表示するフィールドコードの配列"),
@@ -824,7 +834,7 @@ server.tool(
   "get_app_permissions",
   "kintoneアプリのアクセス権限設定を確認する。誰がどの操作（閲覧・追加・編集・削除）を行えるかを表示",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
   },
   async ({ app_id }) => {
     const result = await client.getAppAcl(app_id);
@@ -839,7 +849,7 @@ server.tool(
   "update_app_permissions",
   "kintoneアプリのアクセス権限を設定する。ユーザー/グループ/組織単位で閲覧・追加・編集・削除権限を制御。例: 特定グループに閲覧のみ許可",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     rights: z.array(z.object({
       entity: z.object({
         type: z.enum(["USER", "GROUP", "ORGANIZATION"]).describe("エンティティの種類"),
@@ -907,8 +917,8 @@ server.tool(
   "get_record_history",
   "kintoneレコードの変更履歴を表示する。コメント履歴とリビジョン情報を組み合わせて時系列で表示。「このレコードの経緯を教えて」等に使う",
   {
-    app_id: z.number().describe("アプリID"),
-    record_id: z.number().describe("レコードID"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
   },
   async ({ app_id, record_id }) => {
     // レコード本体（リビジョン、作成者、更新者、作成日時、更新日時）
@@ -960,7 +970,7 @@ server.tool(
   "export_csv",
   "kintoneのレコードをCSV形式で出力する。検索結果をファイルに保存するか、テキストとして返す。「このアプリのデータをCSVでエクスポートして」等に使う",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     query: z.string().optional().describe("絞り込みクエリ"),
     fields: z.array(z.string()).optional().describe("出力するフィールドコードの配列（省略時は全フィールド）"),
     save_path: z.string().optional().describe("保存先ファイルパス（省略時はテキストとして返す）"),
@@ -1041,7 +1051,7 @@ server.tool(
   "get_app_detail",
   "kintoneアプリ1件の詳細情報を取得する。アプリ名、作成者、スペースID、説明等を確認できる。例: 「このアプリの管理者は誰？」「アプリの説明を見せて」",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
   },
   async ({ app_id }) => {
     const app = await client.getApp(app_id);
@@ -1056,7 +1066,7 @@ server.tool(
   "get_process_settings",
   "kintoneアプリのプロセス管理（ワークフロー）設定を取得する。ステータス一覧、遷移条件、各ステータスの作業者を確認できる。例: 「この案件の承認フローはどうなってる？」「どんなステータスがある？」",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
   },
   async ({ app_id }) => {
     const status = await client.getProcessStatus(app_id);
@@ -1071,8 +1081,8 @@ server.tool(
   "update_assignees",
   "kintoneレコードのプロセス管理の作業者を変更する。ステータスは変えずに担当者だけ変更したい場合に使う。例: 「この案件の担当を田中さんに変えて」「作業者を佐藤さんと鈴木さんにして」",
   {
-    app_id: z.number().describe("アプリID"),
-    record_id: z.number().describe("レコードID"),
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
     assignees: z.array(z.string()).describe("新しい作業者のログイン名の配列（例: ['tanaka', 'suzuki']）"),
   },
   async ({ app_id, record_id, assignees }) => {
@@ -1088,12 +1098,12 @@ server.tool(
   "bulk_update_statuses",
   "複数レコードのプロセス管理ステータスを一括更新する。例: 「未処理の案件を全部承認して」「選択した5件をまとめて差し戻して」",
   {
-    app_id: z.number().describe("アプリID"),
+    app_id: z.number().int().positive().describe("アプリID"),
     records: z.array(z.object({
-      id: z.number().describe("レコードID"),
+      id: z.number().int().positive().describe("レコードID"),
       action: z.string().describe("実行するアクション名（例: '承認する'）"),
       assignee: z.string().optional().describe("次の作業者のログイン名"),
-    })).describe("ステータス更新対象の配列"),
+    })).max(100).describe("ステータス更新対象の配列（最大100件）"),
   },
   async ({ app_id, records }) => {
     const result = await client.bulkUpdateStatuses(app_id, records);
@@ -1122,11 +1132,113 @@ server.tool(
   }
 );
 
+// --- ユーザー一覧取得 ---
+server.tool(
+  "get_users",
+  "kintone環境のユーザー一覧を取得する",
+  {
+    offset: z.number().int().optional().default(0).describe("取得開始位置"),
+    limit: z.number().int().optional().default(100).describe("取得件数"),
+  },
+  async ({ offset, limit }) => {
+    const result = await client.getUsers(offset, limit);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.users, null, 2) }],
+    };
+  }
+);
+
+// --- グループ一覧取得 ---
+server.tool(
+  "get_groups",
+  "kintone環境のグループ一覧を取得する",
+  {
+    offset: z.number().int().optional().default(0).describe("取得開始位置"),
+    limit: z.number().int().optional().default(100).describe("取得件数"),
+  },
+  async ({ offset, limit }) => {
+    const result = await client.getGroups(offset, limit);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.groups, null, 2) }],
+    };
+  }
+);
+
+// --- 組織一覧取得 ---
+server.tool(
+  "get_organizations",
+  "kintone環境の組織一覧を取得する",
+  {
+    offset: z.number().int().optional().default(0).describe("取得開始位置"),
+    limit: z.number().int().optional().default(100).describe("取得件数"),
+  },
+  async ({ offset, limit }) => {
+    const result = await client.getOrganizations(offset, limit);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.organizations, null, 2) }],
+    };
+  }
+);
+
+// --- レコードACL取得 ---
+server.tool(
+  "get_record_permissions",
+  "kintoneアプリのレコード単位のアクセス権限設定を取得する",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+  },
+  async ({ app_id }) => {
+    const result = await client.getRecordAcl(app_id);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.rights, null, 2) }],
+    };
+  }
+);
+
+// --- フィールドACL取得 ---
+server.tool(
+  "get_field_permissions",
+  "kintoneアプリのフィールド単位のアクセス権限設定を取得する",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+  },
+  async ({ app_id }) => {
+    const result = await client.getFieldAcl(app_id);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.rights, null, 2) }],
+    };
+  }
+);
+
+// --- スレッド作成 ---
+server.tool(
+  "create_thread",
+  "kintoneスペースに新しいスレッドを作成する",
+  {
+    space_id: z.number().int().positive().describe("スペースID"),
+    name: z.string().describe("スレッド名"),
+  },
+  async ({ space_id, name }) => {
+    const result = await client.addSpaceThread(space_id, name);
+    return {
+      content: [{ type: "text" as const, text: `スレッド作成完了: thread_id=${result.id}` }],
+    };
+  }
+);
+
 // --- サーバー起動 ---
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("kintone-workflow-mcp server started");
+
+  // Graceful shutdown
+  const shutdown = () => {
+    console.error("kintone-workflow-mcp server shutting down...");
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 main().catch((error) => {

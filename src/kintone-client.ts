@@ -4,7 +4,9 @@
  */
 
 import path from "path";
+import fs from "fs";
 import os from "os";
+import crypto from "crypto";
 
 export interface KintoneConfig {
   baseUrl: string; // https://example.cybozu.com
@@ -126,16 +128,21 @@ export class KintoneClient {
 
   // --- コメント操作 ---
 
-  /** コメント追加 */
+  /** コメント追加（メンション対応） */
   async addComment(
     appId: number,
     recordId: number,
-    text: string
+    text: string,
+    mentions?: { code: string; type: "USER" | "GROUP" | "ORGANIZATION" }[]
   ): Promise<{ id: string }> {
+    const comment: Record<string, unknown> = { text };
+    if (mentions && mentions.length > 0) {
+      comment.mentions = mentions;
+    }
     const res = await this.request("POST", "/k/v1/record/comment.json", {
       app: appId,
       record: recordId,
-      comment: { text },
+      comment,
     });
     return res as { id: string };
   }
@@ -387,6 +394,40 @@ export class KintoneClient {
     return res as { revision: string };
   }
 
+  // --- レコードACL / フィールドACL ---
+
+  /** レコードのアクセス権限取得 */
+  async getRecordAcl(appId: number): Promise<{ rights: unknown[] }> {
+    const res = await this.request("GET", `/k/v1/record/acl.json?app=${appId}`);
+    return res as { rights: unknown[] };
+  }
+
+  /** フィールドのアクセス権限取得 */
+  async getFieldAcl(appId: number): Promise<{ rights: unknown[] }> {
+    const res = await this.request("GET", `/k/v1/field/acl.json?app=${appId}`);
+    return res as { rights: unknown[] };
+  }
+
+  // --- ユーザー/グループ/組織（Cybozu User API） ---
+
+  /** ユーザー一覧取得 */
+  async getUsers(offset = 0, limit = 100): Promise<{ users: unknown[] }> {
+    const res = await this.request("GET", `/v1/users.json?offset=${offset}&size=${limit}`);
+    return res as { users: unknown[] };
+  }
+
+  /** グループ一覧取得 */
+  async getGroups(offset = 0, limit = 100): Promise<{ groups: unknown[] }> {
+    const res = await this.request("GET", `/v1/groups.json?offset=${offset}&size=${limit}`);
+    return res as { groups: unknown[] };
+  }
+
+  /** 組織一覧取得 */
+  async getOrganizations(offset = 0, limit = 100): Promise<{ organizations: unknown[] }> {
+    const res = await this.request("GET", `/v1/organizations.json?offset=${offset}&size=${limit}`);
+    return res as { organizations: unknown[] };
+  }
+
   // --- スペース管理 ---
 
   /** スペース情報取得 */
@@ -524,7 +565,8 @@ export class KintoneClient {
   async getAllRecords(
     appId: number,
     query?: string,
-    fields?: string[]
+    fields?: string[],
+    maxRecords = 50000
   ): Promise<KintoneRecord[]> {
     let cursorId: string | undefined;
     try {
@@ -535,6 +577,13 @@ export class KintoneClient {
       while (true) {
         const result = await this.getRecordsByCursor(cursorId);
         allRecords.push(...result.records);
+        if (allRecords.length > maxRecords) {
+          // カーソルをクリーンアップしてからエラー
+          try { await this.deleteCursor(cursorId); } catch { /* ignore */ }
+          throw new Error(
+            `取得件数が上限(${maxRecords}件)を超えました。queryで絞り込むか、export_csvを使用してください`
+          );
+        }
         if (!result.next) break;
       }
       // カーソルは全件取得後に自動削除されるが、念のため
@@ -579,22 +628,28 @@ export class KintoneClient {
 
   // --- パス検証ヘルパー ---
 
-  /** ファイルパスが許可ディレクトリ内かを検証する */
+  /** ファイルパスが許可ディレクトリ内かを検証する（シンボリックリンク対策付き） */
   static validateFilePath(filePath: string): string {
     const resolved = path.resolve(filePath);
     const homeDir = os.homedir();
     const tmpDir = os.tmpdir();
     const allowedPrefixes = [tmpDir, "/tmp", homeDir];
 
+    // ファイルが存在する場合はrealpathでシンボリックリンクを解決
+    let checkPath = resolved;
+    if (fs.existsSync(resolved)) {
+      checkPath = fs.realpathSync(resolved);
+    }
+
     const isAllowed = allowedPrefixes.some((prefix) =>
-      resolved.startsWith(prefix + path.sep) || resolved === prefix
+      checkPath.startsWith(prefix + path.sep) || checkPath === prefix
     );
     if (!isAllowed) {
       throw new Error(
-        `セキュリティエラー: ファイルパス "${resolved}" は許可されたディレクトリ（/tmp または HOME配下）の外です`
+        `セキュリティエラー: ファイルパス "${checkPath}" は許可されたディレクトリ（/tmp または HOME配下）の外です`
       );
     }
-    return resolved;
+    return checkPath;
   }
 
   /** クエリ値のエスケープ（ダブルクォート） */
@@ -649,12 +704,17 @@ export class KintoneClient {
     }
   }
 
+  /** リトライ対象のステータスコード */
+  private static readonly RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
+
   private async requestWithRetry(
     method: string,
     apiPath: string,
     body: unknown,
-    retryCount: number
+    retryCount: number,
+    requestId?: string
   ): Promise<KintoneResponse> {
+    const reqId = requestId ?? crypto.randomUUID();
     const url = `${this.baseUrl}${apiPath}`;
     const headers = { ...this.headers };
     // GETリクエストではContent-Typeを送らない（kintone APIが400を返す）
@@ -684,6 +744,8 @@ export class KintoneClient {
       console.error(
         JSON.stringify({
           ts: new Date().toISOString(),
+          request_id: reqId,
+          level: response.ok ? "info" : "error",
           method,
           path: apiPath.split("?")[0],
           status: response.status,
@@ -691,27 +753,34 @@ export class KintoneClient {
         })
       );
 
-      // 429 Too Many Requests → 指数バックオフでリトライ
-      if (response.status === 429) {
+      // 429 / 502 / 503 / 504 → 指数バックオフでリトライ
+      if (KintoneClient.RETRYABLE_STATUSES.has(response.status)) {
         if (retryCount >= this.maxRetries) {
           const errorBody = await response.text();
           throw new Error(
-            `kintone APIレート制限: ${this.maxRetries}回リトライ後も429。${method} ${apiPath.split("?")[0]}\n${errorBody}`
+            `kintone APIエラー: ${this.maxRetries}回リトライ後も${response.status}。${method} ${apiPath.split("?")[0]}\n${errorBody}`
           );
         }
-        const backoffMs = 1000 * Math.pow(2, retryCount);
+        // Retry-Afterヘッダーがあればその値を使用
+        const retryAfter = response.headers.get("Retry-After");
+        const backoffMs = retryAfter
+          ? Number(retryAfter) * 1000
+          : 1000 * Math.pow(2, retryCount);
         console.error(
           JSON.stringify({
             ts: new Date().toISOString(),
-            event: "rate_limit_retry",
+            request_id: reqId,
+            level: "warn",
+            event: "retryable_error",
             method,
             path: apiPath.split("?")[0],
+            status: response.status,
             retry: retryCount + 1,
             backoff_ms: backoffMs,
           })
         );
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        return this.requestWithRetry(method, apiPath, body, retryCount + 1);
+        return this.requestWithRetry(method, apiPath, body, retryCount + 1, reqId);
       }
 
       if (!response.ok) {
@@ -730,9 +799,11 @@ export class KintoneClient {
         console.error(
           JSON.stringify({
             ts: new Date().toISOString(),
+            request_id: reqId,
+            level: "error",
             method,
             path: apiPath.split("?")[0],
-            status: "error",
+            status: "timeout",
             elapsed_ms: elapsed,
           })
         );
@@ -745,6 +816,8 @@ export class KintoneClient {
       console.error(
         JSON.stringify({
           ts: new Date().toISOString(),
+          request_id: reqId,
+          level: "error",
           method,
           path: apiPath.split("?")[0],
           status: "error",

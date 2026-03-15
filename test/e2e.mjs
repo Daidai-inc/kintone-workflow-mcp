@@ -7,10 +7,18 @@
 
 import { KintoneClient } from "../dist/kintone-client.js";
 
-// --- 設定 ---
-const BASE_URL = process.env.KINTONE_BASE_URL || "https://pj43gdty3535.cybozu.com";
-const USERNAME = process.env.KINTONE_USERNAME || "falcaofalcaofalcao86@gmail.com";
-const PASSWORD = process.env.KINTONE_PASSWORD || "Dogosta0328";
+// --- 設定（環境変数から取得。ハードコード禁止） ---
+const BASE_URL = process.env.KINTONE_BASE_URL;
+const USERNAME = process.env.KINTONE_USERNAME;
+const PASSWORD = process.env.KINTONE_PASSWORD;
+
+if (!BASE_URL || !USERNAME || !PASSWORD) {
+  console.error("環境変数が未設定です。以下を設定してから実行してください:");
+  console.error("  export KINTONE_BASE_URL=https://your-domain.cybozu.com");
+  console.error("  export KINTONE_USERNAME=your-username");
+  console.error("  export KINTONE_PASSWORD=your-password");
+  process.exit(1);
+}
 
 const client = new KintoneClient({
   baseUrl: BASE_URL,
