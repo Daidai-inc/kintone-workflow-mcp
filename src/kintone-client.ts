@@ -188,6 +188,102 @@ export class KintoneClient {
     return res as { properties: Record<string, unknown> };
   }
 
+  // --- 一括操作 ---
+
+  /** レコード一括作成（最大100件） */
+  async createRecords(
+    appId: number,
+    records: KintoneRecord[]
+  ): Promise<{ ids: string[]; revisions: string[] }> {
+    const res = await this.request("POST", "/k/v1/records.json", {
+      app: appId,
+      records,
+    });
+    return res as { ids: string[]; revisions: string[] };
+  }
+
+  /** レコード一括更新（最大100件） */
+  async updateRecords(
+    appId: number,
+    records: { id: number; record: KintoneRecord; revision?: number }[]
+  ): Promise<{ records: { id: string; revision: string }[] }> {
+    const res = await this.request("PUT", "/k/v1/records.json", {
+      app: appId,
+      records: records.map((r) => ({
+        id: r.id,
+        record: r.record,
+        ...(r.revision !== undefined ? { revision: r.revision } : {}),
+      })),
+    });
+    return res as { records: { id: string; revision: string }[] };
+  }
+
+  // --- アプリ管理 ---
+
+  /** アプリ作成（プレビュー環境に作成。deploy_appで本番反映） */
+  async createApp(
+    name: string,
+    space?: number
+  ): Promise<{ app: string; revision: string }> {
+    const body: Record<string, unknown> = { name };
+    if (space !== undefined) body.space = space;
+    const res = await this.request("POST", "/k/v1/preview/app.json", body);
+    return res as { app: string; revision: string };
+  }
+
+  /** フィールド追加（プレビュー環境。各プロパティにcodeを自動付与） */
+  async addFields(
+    appId: number,
+    properties: Record<string, Record<string, unknown>>
+  ): Promise<{ revision: string }> {
+    // 各フィールドにcodeが含まれていなければキー名をcodeとして自動付与
+    const props: Record<string, Record<string, unknown>> = {};
+    for (const [key, value] of Object.entries(properties)) {
+      props[key] = { ...value, code: value.code ?? key };
+    }
+    const res = await this.request("POST", "/k/v1/preview/app/form/fields.json", {
+      app: appId,
+      properties: props,
+    });
+    return res as { revision: string };
+  }
+
+  /** アプリデプロイ（プレビュー→本番） */
+  async deployApp(appId: number): Promise<void> {
+    await this.request("POST", "/k/v1/preview/app/deploy.json", {
+      apps: [{ app: appId }],
+    });
+  }
+
+  /** デプロイ状態確認 */
+  async getDeployStatus(appIds: number[]): Promise<{ apps: { app: string; status: string }[] }> {
+    const params = appIds.map((id) => `apps=${id}`).join("&");
+    const res = await this.request("GET", `/k/v1/preview/app/deploy.json?${params}`);
+    return res as { apps: { app: string; status: string }[] };
+  }
+
+  // --- 集計用ヘルパー ---
+
+  /** 全レコード取得（500件制限を超えて自動ページング） */
+  async getAllRecords(
+    appId: number,
+    query?: string,
+    fields?: string[]
+  ): Promise<KintoneRecord[]> {
+    const allRecords: KintoneRecord[] = [];
+    let offset = 0;
+    const limit = 500;
+
+    while (true) {
+      const result = await this.getRecords(appId, query, fields, limit, offset);
+      allRecords.push(...result.records);
+      if (result.records.length < limit) break;
+      offset += limit;
+      if (offset >= 10000) break; // kintone offset上限
+    }
+    return allRecords;
+  }
+
   // --- 内部メソッド ---
 
   private async request(
@@ -196,9 +292,14 @@ export class KintoneClient {
     body?: unknown
   ): Promise<KintoneResponse> {
     const url = `${this.baseUrl}${path}`;
+    const headers = { ...this.headers };
+    // GETリクエストではContent-Typeを送らない（kintone APIが400を返す）
+    if (method === "GET") {
+      delete headers["Content-Type"];
+    }
     const options: RequestInit = {
       method,
-      headers: this.headers,
+      headers,
     };
     if (body && (method === "POST" || method === "PUT" || method === "DELETE")) {
       options.body = JSON.stringify(body);
