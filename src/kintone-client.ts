@@ -25,6 +25,14 @@ export class KintoneClient {
   private baseUrl: string;
   private headers: Record<string, string>;
 
+  // レート制限
+  private concurrentRequests = 0;
+  private readonly maxConcurrent = 10;
+  private lastRequestTime = 0;
+  private readonly minInterval = 100; // ms
+  private readonly maxRetries = 3;
+  private waitQueue: (() => void)[] = [];
+
   constructor(config: KintoneConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, "");
     this.headers = {
@@ -596,10 +604,56 @@ export class KintoneClient {
 
   // --- 内部メソッド ---
 
+  /** 同時リクエスト数の上限待機 */
+  private async waitForConcurrencySlot(): Promise<void> {
+    if (this.concurrentRequests < this.maxConcurrent) return;
+    return new Promise<void>((resolve) => {
+      this.waitQueue.push(resolve);
+    });
+  }
+
+  /** 同時リクエスト枠を解放し、待機中のリクエストを再開 */
+  private releaseConcurrencySlot(): void {
+    this.concurrentRequests--;
+    const next = this.waitQueue.shift();
+    if (next) next();
+  }
+
+  /** リクエスト間の最小間隔を確保 */
+  private async enforceMinInterval(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRequestTime;
+    if (elapsed < this.minInterval) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, this.minInterval - elapsed)
+      );
+    }
+    this.lastRequestTime = Date.now();
+  }
+
   private async request(
     method: string,
     apiPath: string,
     body?: unknown
+  ): Promise<KintoneResponse> {
+    // 同時リクエスト数制限
+    await this.waitForConcurrencySlot();
+    // 最小間隔の確保
+    await this.enforceMinInterval();
+    this.concurrentRequests++;
+
+    try {
+      return await this.requestWithRetry(method, apiPath, body, 0);
+    } finally {
+      this.releaseConcurrencySlot();
+    }
+  }
+
+  private async requestWithRetry(
+    method: string,
+    apiPath: string,
+    body: unknown,
+    retryCount: number
   ): Promise<KintoneResponse> {
     const url = `${this.baseUrl}${apiPath}`;
     const headers = { ...this.headers };
@@ -636,6 +690,29 @@ export class KintoneClient {
           elapsed_ms: elapsed,
         })
       );
+
+      // 429 Too Many Requests → 指数バックオフでリトライ
+      if (response.status === 429) {
+        if (retryCount >= this.maxRetries) {
+          const errorBody = await response.text();
+          throw new Error(
+            `kintone APIレート制限: ${this.maxRetries}回リトライ後も429。${method} ${apiPath.split("?")[0]}\n${errorBody}`
+          );
+        }
+        const backoffMs = 1000 * Math.pow(2, retryCount);
+        console.error(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: "rate_limit_retry",
+            method,
+            path: apiPath.split("?")[0],
+            retry: retryCount + 1,
+            backoff_ms: backoffMs,
+          })
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        return this.requestWithRetry(method, apiPath, body, retryCount + 1);
+      }
 
       if (!response.ok) {
         const errorBody = await response.text();
