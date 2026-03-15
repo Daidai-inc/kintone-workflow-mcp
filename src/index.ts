@@ -417,6 +417,232 @@ server.tool(
   }
 );
 
+// --- 全アプリスキーマ取得（AIがkintoneの中身を理解する入口） ---
+server.tool(
+  "describe_all_apps",
+  "kintone環境にある全アプリの名前とフィールド一覧を取得する。AIがkintoneの構造を理解するために最初に呼ぶべきツール。「kintoneに何があるか教えて」「使えるアプリを一覧して」等に使う",
+  {},
+  async () => {
+    const apps = await client.describeAllApps();
+
+    let result = `kintone環境のアプリ一覧（${apps.length}件）\n\n`;
+
+    for (const app of apps) {
+      result += `━━━ アプリ${app.appId}: ${app.name} ━━━\n`;
+      if (app.fields.length === 0) {
+        result += `  （フィールド情報なし）\n`;
+      } else {
+        // システムフィールドを除外して表示
+        const userFields = app.fields.filter(f =>
+          !["RECORD_NUMBER", "CREATED_TIME", "UPDATED_TIME", "CREATOR", "MODIFIER", "STATUS", "STATUS_ASSIGNEE", "CATEGORY"].includes(f.type)
+        );
+        const systemFields = app.fields.filter(f =>
+          ["RECORD_NUMBER", "CREATED_TIME", "UPDATED_TIME", "CREATOR", "MODIFIER", "STATUS", "STATUS_ASSIGNEE", "CATEGORY"].includes(f.type)
+        );
+
+        if (userFields.length > 0) {
+          result += `  ユーザーフィールド:\n`;
+          for (const f of userFields) {
+            result += `    - ${f.label}（${f.code}）: ${f.type}\n`;
+          }
+        }
+        result += `  システムフィールド: ${systemFields.map(f => f.label || f.code).join(", ")}\n`;
+      }
+      result += `  URL: ${process.env.KINTONE_BASE_URL}/k/${app.appId}/\n\n`;
+    }
+
+    result += `\nヒント: 特定のアプリを操作するにはapp_idを指定してください。\n`;
+    result += `例: 「アプリ${apps[0]?.appId || "1"}のレコードを検索して」\n`;
+
+    return { content: [{ type: "text" as const, text: result }] };
+  }
+);
+
+// --- スマート検索（自然言語→kintoneクエリ変換） ---
+server.tool(
+  "smart_search",
+  "自然言語でkintoneを検索する。日付や条件を自動でkintoneクエリに変換する。「先月の未完了案件」「金額100万以上の案件」「田中さん担当の案件」等に使う",
+  {
+    app_id: z.number().describe("アプリID"),
+    natural_query: z.string().describe("自然言語の検索条件（例: '先月の未完了案件', '金額100万以上'）"),
+    sort_by: z.string().optional().describe("ソートするフィールドコード"),
+    sort_order: z.enum(["asc", "desc"]).optional().default("desc").describe("ソート順"),
+    limit: z.number().optional().default(100).describe("取得件数"),
+  },
+  async ({ app_id, natural_query, sort_by, sort_order, limit }) => {
+    // まずアプリのフィールド情報を取得
+    const fieldsResult = await client.getFormFields(app_id);
+    const fields = Object.entries(fieldsResult.properties).map(([code, prop]) => ({
+      code,
+      type: (prop as Record<string, unknown>).type as string,
+      label: (prop as Record<string, unknown>).label as string,
+    }));
+
+    // フィールド情報を元に自然言語をkintoneクエリに変換するヒントを生成
+    const fieldInfo = fields
+      .filter(f => !["RECORD_NUMBER", "CREATOR", "MODIFIER", "STATUS_ASSIGNEE", "CATEGORY"].includes(f.type))
+      .map(f => `${f.label}(${f.code}): ${f.type}`)
+      .join(", ");
+
+    // 日付ヘルパー
+    const now = new Date();
+    const today = now.toISOString().split("T")[0];
+    const thisMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthStart = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, "0")}-01`;
+    const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split("T")[0];
+
+    // よくあるパターンの自動変換
+    let query = natural_query;
+    let autoConverted = false;
+
+    // 「先月」→ 日付範囲
+    if (/先月/.test(natural_query)) {
+      const dateField = fields.find(f => ["DATE", "DATETIME", "CREATED_TIME", "UPDATED_TIME"].includes(f.type));
+      if (dateField) {
+        query = `${dateField.code} >= "${lastMonthStart}" and ${dateField.code} <= "${lastMonthEnd}"`;
+        autoConverted = true;
+      }
+    }
+    // 「今月」→ 日付範囲
+    if (/今月/.test(natural_query)) {
+      const dateField = fields.find(f => ["DATE", "DATETIME", "CREATED_TIME", "UPDATED_TIME"].includes(f.type));
+      if (dateField) {
+        query = `${dateField.code} >= "${thisMonth}-01"`;
+        autoConverted = true;
+      }
+    }
+    // 「今日」→ 日付
+    if (/今日/.test(natural_query)) {
+      const dateField = fields.find(f => ["DATE", "DATETIME", "CREATED_TIME", "UPDATED_TIME"].includes(f.type));
+      if (dateField) {
+        query = `${dateField.code} = "${today}"`;
+        autoConverted = true;
+      }
+    }
+
+    // ソート
+    if (sort_by) {
+      query += ` order by ${sort_by} ${sort_order}`;
+    }
+
+    // 自動変換できなかった場合、クエリヒントと一緒にフィールド情報を返す
+    if (!autoConverted) {
+      // そのままクエリとして渡してみる（ユーザーがkintoneクエリを書いた場合）
+      try {
+        const result = await client.getRecords(app_id, query, undefined, limit);
+        return {
+          content: [{
+            type: "text" as const,
+            text: `検索結果: ${result.totalCount}件中${result.records.length}件\n\n${JSON.stringify(result.records, null, 2)}`,
+          }],
+        };
+      } catch {
+        // クエリ変換失敗 → フィールド情報を返してAIに変換を任せる
+        return {
+          content: [{
+            type: "text" as const,
+            text: `自然言語「${natural_query}」をkintoneクエリに自動変換できませんでした。\n\nこのアプリのフィールド:\n${fieldInfo}\n\n日付参考: 今日=${today}, 今月開始=${thisMonth}-01, 先月=${lastMonthStart}〜${lastMonthEnd}\n\nkintoneクエリ構文で再度search_recordsを呼んでください。\n例: search_records(app_id=${app_id}, query='フィールドコード = "値"')`,
+          }],
+        };
+      }
+    }
+
+    const result = await client.getRecords(app_id, query, undefined, limit);
+
+    let response = `検索: 「${natural_query}」\n`;
+    response += `変換クエリ: ${query}\n`;
+    response += `結果: ${result.totalCount}件中${result.records.length}件\n\n`;
+    response += JSON.stringify(result.records, null, 2);
+
+    return { content: [{ type: "text" as const, text: response }] };
+  }
+);
+
+// --- ワークフロー実行（複数操作の連鎖） ---
+server.tool(
+  "execute_workflow",
+  "複数のkintone操作を連鎖して実行する。「未対応案件を検索→担当者にリマインドコメント→ステータス更新」等の複合操作を1回で実行。",
+  {
+    app_id: z.number().describe("対象アプリID"),
+    search_query: z.string().describe("対象レコードを絞り込むクエリ"),
+    actions: z.array(z.object({
+      type: z.enum(["comment", "update_field", "update_status"]).describe("アクションの種類"),
+      comment_text: z.string().optional().describe("コメント本文（type=comment時）"),
+      field_code: z.string().optional().describe("更新するフィールドコード（type=update_field時）"),
+      field_value: z.string().optional().describe("更新する値（type=update_field時）"),
+      status_action: z.string().optional().describe("プロセス管理のアクション名（type=update_status時）"),
+    })).describe("実行するアクションの配列（順番に実行）"),
+    dry_run: z.boolean().optional().default(false).describe("trueにすると対象レコードの確認のみ行い、実際の操作は行わない"),
+  },
+  async ({ app_id, search_query, actions, dry_run }) => {
+    // 対象レコードを取得
+    const records = await client.getAllRecords(app_id, search_query);
+
+    if (records.length === 0) {
+      return { content: [{ type: "text" as const, text: `対象レコード: 0件（クエリ: ${search_query}）\n操作はスキップしました。` }] };
+    }
+
+    let result = `対象レコード: ${records.length}件（クエリ: ${search_query}）\n`;
+
+    if (dry_run) {
+      result += `\n【ドライラン】実際の操作は行いません。\n`;
+      result += `対象レコードID: ${records.map(r => (r["$id"] as { value: string })?.value || "?").join(", ")}\n`;
+      result += `予定アクション:\n`;
+      for (const action of actions) {
+        switch (action.type) {
+          case "comment": result += `  - コメント追加: "${action.comment_text}"\n`; break;
+          case "update_field": result += `  - フィールド更新: ${action.field_code} = "${action.field_value}"\n`; break;
+          case "update_status": result += `  - ステータス変更: "${action.status_action}"\n`; break;
+        }
+      }
+      return { content: [{ type: "text" as const, text: result }] };
+    }
+
+    // 各レコードに対してアクションを実行
+    let successCount = 0;
+    let errorCount = 0;
+
+    for (const record of records) {
+      const recordId = Number((record["$id"] as { value: string })?.value);
+      if (!recordId) continue;
+
+      for (const action of actions) {
+        try {
+          switch (action.type) {
+            case "comment":
+              if (action.comment_text) {
+                await client.addComment(app_id, recordId, action.comment_text);
+              }
+              break;
+            case "update_field":
+              if (action.field_code && action.field_value !== undefined) {
+                await client.updateRecord(app_id, recordId, {
+                  [action.field_code]: { value: action.field_value },
+                });
+              }
+              break;
+            case "update_status":
+              if (action.status_action) {
+                await client.updateStatus(app_id, recordId, action.status_action);
+              }
+              break;
+          }
+          successCount++;
+        } catch (e) {
+          errorCount++;
+          result += `  エラー（レコード${recordId}）: ${(e as Error).message?.slice(0, 60)}\n`;
+        }
+      }
+    }
+
+    result += `\n実行完了: ${successCount}操作成功`;
+    if (errorCount > 0) result += ` / ${errorCount}操作失敗`;
+
+    return { content: [{ type: "text" as const, text: result }] };
+  }
+);
+
 // --- サーバー起動 ---
 async function main() {
   const transport = new StdioServerTransport();

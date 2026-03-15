@@ -284,6 +284,30 @@ export class KintoneClient {
     return allRecords;
   }
 
+  // --- スキーマ取得 ---
+
+  /** 全アプリのスキーマ（アプリ名+フィールド一覧）を取得 */
+  async describeAllApps(): Promise<{ appId: string; name: string; fields: { code: string; type: string; label: string }[] }[]> {
+    const appsResult = await this.getApps();
+    const apps = appsResult.apps as { appId: string; name: string }[];
+    const descriptions = [];
+
+    for (const app of apps) {
+      try {
+        const fieldsResult = await this.getFormFields(Number(app.appId));
+        const fields = Object.entries(fieldsResult.properties).map(([code, prop]) => ({
+          code,
+          type: (prop as Record<string, unknown>).type as string,
+          label: (prop as Record<string, unknown>).label as string,
+        }));
+        descriptions.push({ appId: app.appId, name: app.name, fields });
+      } catch {
+        descriptions.push({ appId: app.appId, name: app.name, fields: [] });
+      }
+    }
+    return descriptions;
+  }
+
   // --- 内部メソッド ---
 
   private async request(
