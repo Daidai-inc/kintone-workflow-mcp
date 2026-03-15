@@ -262,6 +262,160 @@ export class KintoneClient {
     return res as { apps: { app: string; status: string }[] };
   }
 
+  // --- ファイル操作 ---
+
+  /** ファイルアップロード（multipart/form-data） */
+  async uploadFile(filePath: string, fileName?: string): Promise<{ fileKey: string }> {
+    const fs = await import("fs");
+    const path = await import("path");
+    const actualFileName = fileName ?? path.basename(filePath);
+    const fileData = fs.readFileSync(filePath);
+    const blob = new Blob([fileData]);
+
+    const formData = new FormData();
+    formData.append("file", blob, actualFileName);
+
+    const url = `${this.baseUrl}/k/v1/file.json`;
+    const headers: Record<string, string> = {};
+    // Content-Typeは設定しない（FormDataが自動設定）
+    for (const [key, value] of Object.entries(this.headers)) {
+      if (key.toLowerCase() !== "content-type") {
+        headers[key] = value;
+      }
+    }
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: formData,
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`kintone API error: ${response.status} ${response.statusText}\n${errorBody}`);
+    }
+    return (await response.json()) as { fileKey: string };
+  }
+
+  /** ファイルダウンロード */
+  async downloadFile(fileKey: string): Promise<ArrayBuffer> {
+    const url = `${this.baseUrl}/k/v1/file.json?fileKey=${encodeURIComponent(fileKey)}`;
+    const headers = { ...this.headers };
+    delete headers["Content-Type"];
+
+    const response = await fetch(url, { method: "GET", headers });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`kintone API error: ${response.status} ${response.statusText}\n${errorBody}`);
+    }
+    return await response.arrayBuffer();
+  }
+
+  // --- フィールド更新・削除 ---
+
+  /** フィールド更新（プレビュー環境） */
+  async updateFields(
+    appId: number,
+    properties: Record<string, Record<string, unknown>>
+  ): Promise<{ revision: string }> {
+    const res = await this.request("PUT", "/k/v1/preview/app/form/fields.json", {
+      app: appId,
+      properties,
+    });
+    return res as { revision: string };
+  }
+
+  /** フィールド削除（プレビュー環境） */
+  async deleteFields(
+    appId: number,
+    fields: string[]
+  ): Promise<{ revision: string }> {
+    const res = await this.request("DELETE", "/k/v1/preview/app/form/fields.json", {
+      app: appId,
+      fields,
+    });
+    return res as { revision: string };
+  }
+
+  // --- ビュー管理 ---
+
+  /** ビュー一覧取得 */
+  async getViews(appId: number): Promise<{ views: Record<string, unknown> }> {
+    const res = await this.request("GET", `/k/v1/app/views.json?app=${appId}`);
+    return res as { views: Record<string, unknown> };
+  }
+
+  /** ビュー更新（プレビュー環境） */
+  async updateViews(
+    appId: number,
+    views: Record<string, Record<string, unknown>>
+  ): Promise<{ views: Record<string, unknown>; revision: string }> {
+    const res = await this.request("PUT", "/k/v1/preview/app/views.json", {
+      app: appId,
+      views,
+    });
+    return res as { views: Record<string, unknown>; revision: string };
+  }
+
+  // --- アクセス権限 ---
+
+  /** アプリのアクセス権限取得 */
+  async getAppAcl(appId: number): Promise<{ rights: unknown[] }> {
+    const res = await this.request("GET", `/k/v1/app/acl.json?app=${appId}`);
+    return res as { rights: unknown[] };
+  }
+
+  /** アプリのアクセス権限更新 */
+  async updateAppAcl(
+    appId: number,
+    rights: unknown[]
+  ): Promise<{ revision: string }> {
+    const res = await this.request("PUT", "/k/v1/app/acl.json", {
+      app: appId,
+      rights,
+    });
+    return res as { revision: string };
+  }
+
+  // --- スペース管理 ---
+
+  /** スペース情報取得 */
+  async getSpace(spaceId: number): Promise<Record<string, unknown>> {
+    const res = await this.request("GET", `/k/v1/space.json?id=${spaceId}`);
+    return res;
+  }
+
+  /** スペースメンバー一覧 */
+  async getSpaceMembers(spaceId: number): Promise<{ members: unknown[] }> {
+    const res = await this.request("GET", `/k/v1/space/members.json?id=${spaceId}`);
+    return res as { members: unknown[] };
+  }
+
+  /** スレッド追加 */
+  async addSpaceThread(
+    spaceId: number,
+    name: string
+  ): Promise<{ id: string }> {
+    const res = await this.request("POST", "/k/v1/space/thread.json", {
+      space: spaceId,
+      name,
+    });
+    return res as { id: string };
+  }
+
+  /** スレッドにコメント追加 */
+  async addThreadComment(
+    spaceId: number,
+    threadId: number,
+    text: string
+  ): Promise<{ id: string }> {
+    const res = await this.request("POST", "/k/v1/space/thread/comment.json", {
+      space: spaceId,
+      thread: threadId,
+      comment: { text },
+    });
+    return res as { id: string };
+  }
+
   // --- 集計用ヘルパー ---
 
   /** 全レコード取得（500件制限を超えて自動ページング） */

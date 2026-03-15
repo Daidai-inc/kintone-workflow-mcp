@@ -643,6 +643,396 @@ server.tool(
   }
 );
 
+// --- ファイルアップロード ---
+server.tool(
+  "upload_file",
+  "ローカルファイルをkintoneにアップロードしてfileKeyを返す。返されたfileKeyをレコードの添付ファイルフィールドに設定して使う。例: upload_file('/tmp/report.pdf') → fileKeyを取得 → create_record で添付",
+  {
+    file_path: z.string().describe("アップロードするファイルのパス（例: '/tmp/report.pdf'）"),
+    file_name: z.string().optional().describe("kintone上でのファイル名（省略時はファイル名をそのまま使用）"),
+  },
+  async ({ file_path, file_name }) => {
+    const result = await client.uploadFile(file_path, file_name);
+    return {
+      content: [{ type: "text" as const, text: `ファイルアップロード完了\nfileKey: ${result.fileKey}\n\nこのfileKeyをレコードの添付ファイルフィールドに設定してください。\n例: create_record(app_id, { "添付ファイル": { value: [{ fileKey: "${result.fileKey}" }] } })` }],
+    };
+  }
+);
+
+// --- ファイルダウンロード ---
+server.tool(
+  "download_file",
+  "kintoneからファイルをダウンロードして保存する。レコードの添付ファイルフィールドからfileKeyを取得して使う。例: get_record → 添付ファイルフィールドのfileKeyを確認 → download_file",
+  {
+    file_key: z.string().describe("ダウンロードするファイルのfileKey"),
+    save_path: z.string().describe("保存先のファイルパス（例: '/tmp/downloaded_file.pdf'）"),
+  },
+  async ({ file_key, save_path }) => {
+    const fs = await import("fs");
+    const data = await client.downloadFile(file_key);
+    fs.writeFileSync(save_path, Buffer.from(data));
+    return {
+      content: [{ type: "text" as const, text: `ファイルダウンロード完了: ${save_path}（${data.byteLength}バイト）` }],
+    };
+  }
+);
+
+// --- フィールド更新 ---
+server.tool(
+  "update_fields",
+  "kintoneアプリのフィールド設定を変更する（ラベル、必須/任意、選択肢等）。プレビュー環境に反映後、自動デプロイする。例: フィールドのラベルを「氏名」→「お名前」に変更",
+  {
+    app_id: z.number().describe("アプリID"),
+    properties: z.record(z.string(), z.record(z.string(), z.unknown())).describe("フィールドコードをキーとした更新内容（例: { 'name': { label: 'お名前', required: true } }）"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, properties, deploy }) => {
+    const result = await client.updateFields(app_id, properties);
+    let text = `フィールド更新完了（revision: ${result.revision}）\n更新フィールド: ${Object.keys(properties).join(", ")}`;
+
+    if (deploy) {
+      await client.deployApp(app_id);
+      for (let i = 0; i < 15; i++) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const status = await client.getDeployStatus([app_id]);
+        if (status.apps[0]?.status === "SUCCESS") {
+          text += "\nデプロイ完了";
+          break;
+        }
+        if (status.apps[0]?.status === "FAIL") {
+          text += "\nデプロイ失敗。手動で確認してください。";
+          break;
+        }
+      }
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- フィールド削除 ---
+server.tool(
+  "delete_fields",
+  "kintoneアプリのフィールドを削除する。プレビュー環境に反映後、自動デプロイする。注意: 削除するとそのフィールドのデータも失われる",
+  {
+    app_id: z.number().describe("アプリID"),
+    field_codes: z.array(z.string()).describe("削除するフィールドコードの配列（例: ['old_field1', 'old_field2']）"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, field_codes, deploy }) => {
+    const result = await client.deleteFields(app_id, field_codes);
+    let text = `フィールド削除完了（revision: ${result.revision}）\n削除フィールド: ${field_codes.join(", ")}`;
+
+    if (deploy) {
+      await client.deployApp(app_id);
+      for (let i = 0; i < 15; i++) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const status = await client.getDeployStatus([app_id]);
+        if (status.apps[0]?.status === "SUCCESS") {
+          text += "\nデプロイ完了";
+          break;
+        }
+        if (status.apps[0]?.status === "FAIL") {
+          text += "\nデプロイ失敗。手動で確認してください。";
+          break;
+        }
+      }
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- ビュー一覧取得 ---
+server.tool(
+  "get_views",
+  "kintoneアプリのビュー（一覧）定義を取得する。フィルタ条件・表示フィールド・ソート順を確認できる",
+  {
+    app_id: z.number().describe("アプリID"),
+  },
+  async ({ app_id }) => {
+    const result = await client.getViews(app_id);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.views, null, 2) }],
+    };
+  }
+);
+
+// --- ビュー作成 ---
+server.tool(
+  "create_view",
+  "kintoneアプリに新しいビュー（一覧）を作成する。フィルタ条件・表示フィールド・ソート順を指定可能。例: '未完了案件' ビューを作成",
+  {
+    app_id: z.number().describe("アプリID"),
+    name: z.string().describe("ビュー名（例: '未完了案件一覧'）"),
+    type: z.enum(["LIST", "CALENDAR", "CUSTOM"]).optional().default("LIST").describe("ビューの種類"),
+    fields: z.array(z.string()).optional().describe("表示するフィールドコードの配列"),
+    filter_cond: z.string().optional().describe("フィルタ条件（kintoneクエリ構文。例: 'ステータス in (\"未着手\", \"対応中\")'）"),
+    sort: z.string().optional().describe("ソート条件（例: '更新日時 desc'）"),
+    deploy: z.boolean().optional().default(true).describe("作成後に自動デプロイするか"),
+  },
+  async ({ app_id, name, type, fields, filter_cond, sort, deploy }) => {
+    // 既存ビューを取得して最大indexを確認
+    const existing = await client.getViews(app_id);
+    const existingViews = existing.views as Record<string, Record<string, unknown>>;
+    let maxIndex = 0;
+    for (const view of Object.values(existingViews)) {
+      const idx = Number(view.index ?? 0);
+      if (idx > maxIndex) maxIndex = idx;
+    }
+
+    const viewDef: Record<string, unknown> = {
+      type,
+      name,
+      index: String(maxIndex + 1),
+    };
+    if (fields) viewDef.fields = fields;
+    if (filter_cond) viewDef.filterCond = filter_cond;
+    if (sort) viewDef.sort = sort;
+
+    const views: Record<string, Record<string, unknown>> = {
+      [name]: viewDef as Record<string, unknown>,
+    };
+
+    const result = await client.updateViews(app_id, views);
+    let text = `ビュー「${name}」を作成しました（revision: ${result.revision}）`;
+
+    if (deploy) {
+      await client.deployApp(app_id);
+      for (let i = 0; i < 15; i++) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const status = await client.getDeployStatus([app_id]);
+        if (status.apps[0]?.status === "SUCCESS") {
+          text += "\nデプロイ完了";
+          break;
+        }
+        if (status.apps[0]?.status === "FAIL") {
+          text += "\nデプロイ失敗。手動で確認してください。";
+          break;
+        }
+      }
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- アクセス権限取得 ---
+server.tool(
+  "get_app_permissions",
+  "kintoneアプリのアクセス権限設定を確認する。誰がどの操作（閲覧・追加・編集・削除）を行えるかを表示",
+  {
+    app_id: z.number().describe("アプリID"),
+  },
+  async ({ app_id }) => {
+    const result = await client.getAppAcl(app_id);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.rights, null, 2) }],
+    };
+  }
+);
+
+// --- アクセス権限更新 ---
+server.tool(
+  "update_app_permissions",
+  "kintoneアプリのアクセス権限を設定する。ユーザー/グループ/組織単位で閲覧・追加・編集・削除権限を制御。例: 特定グループに閲覧のみ許可",
+  {
+    app_id: z.number().describe("アプリID"),
+    rights: z.array(z.object({
+      entity: z.object({
+        type: z.enum(["USER", "GROUP", "ORGANIZATION"]).describe("エンティティの種類"),
+        code: z.string().describe("ユーザー/グループ/組織のコード"),
+      }).describe("権限を設定する対象"),
+      appEditable: z.boolean().optional().describe("アプリ管理権限"),
+      recordViewable: z.boolean().optional().describe("レコード閲覧権限"),
+      recordAddable: z.boolean().optional().describe("レコード追加権限"),
+      recordEditable: z.boolean().optional().describe("レコード編集権限"),
+      recordDeletable: z.boolean().optional().describe("レコード削除権限"),
+    })).describe("権限設定の配列"),
+  },
+  async ({ app_id, rights }) => {
+    const result = await client.updateAppAcl(app_id, rights);
+    return {
+      content: [{ type: "text" as const, text: `アクセス権限を更新しました（revision: ${result.revision}）` }],
+    };
+  }
+);
+
+// --- スペース情報取得 ---
+server.tool(
+  "get_space",
+  "kintoneスペースの情報を取得する。スペース名、メンバー、スレッド一覧等を確認できる",
+  {
+    space_id: z.number().describe("スペースID"),
+  },
+  async ({ space_id }) => {
+    const space = await client.getSpace(space_id);
+    let text = `スペース情報\n`;
+    text += JSON.stringify(space, null, 2);
+
+    // メンバー一覧も取得
+    try {
+      const members = await client.getSpaceMembers(space_id);
+      text += `\n\nメンバー（${members.members.length}名）:\n`;
+      text += JSON.stringify(members.members, null, 2);
+    } catch {
+      text += `\n\nメンバー情報の取得に失敗しました`;
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- スレッドコメント追加 ---
+server.tool(
+  "add_thread_comment",
+  "kintoneスペースのスレッドにコメントを投稿する。チームへの通知や情報共有に使う",
+  {
+    space_id: z.number().describe("スペースID"),
+    thread_id: z.number().describe("スレッドID"),
+    text: z.string().describe("コメント本文"),
+  },
+  async ({ space_id, thread_id, text }) => {
+    const result = await client.addThreadComment(space_id, thread_id, text);
+    return {
+      content: [{ type: "text" as const, text: `スレッドコメント投稿完了（comment_id: ${result.id}）` }],
+    };
+  }
+);
+
+// --- レコード変更履歴（コメント+リビジョンから疑似取得） ---
+server.tool(
+  "get_record_history",
+  "kintoneレコードの変更履歴を表示する。コメント履歴とリビジョン情報を組み合わせて時系列で表示。「このレコードの経緯を教えて」等に使う",
+  {
+    app_id: z.number().describe("アプリID"),
+    record_id: z.number().describe("レコードID"),
+  },
+  async ({ app_id, record_id }) => {
+    // レコード本体（リビジョン、作成者、更新者、作成日時、更新日時）
+    const record = await client.getRecord(app_id, record_id);
+
+    // コメント取得（新しい順、最大10件）
+    const comments = await client.getComments(app_id, record_id, "asc", 10);
+
+    let text = `レコード ${record_id} の変更履歴\n`;
+    text += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+    // レコード基本情報
+    const creator = record["作成者"] ?? record["CREATOR"] ?? record["$creator"];
+    const createdTime = record["作成日時"] ?? record["CREATED_TIME"] ?? record["$created_time"];
+    const modifier = record["更新者"] ?? record["MODIFIER"] ?? record["$modifier"];
+    const updatedTime = record["更新日時"] ?? record["UPDATED_TIME"] ?? record["$updated_time"];
+    const revision = record["$revision"];
+
+    if (createdTime) {
+      text += `作成: ${(createdTime as { value: unknown }).value}`;
+      if (creator) text += ` by ${JSON.stringify((creator as { value: unknown }).value)}`;
+      text += `\n`;
+    }
+    if (updatedTime) {
+      text += `最終更新: ${(updatedTime as { value: unknown }).value}`;
+      if (modifier) text += ` by ${JSON.stringify((modifier as { value: unknown }).value)}`;
+      text += `\n`;
+    }
+    if (revision) {
+      text += `リビジョン: ${(revision as { value: unknown }).value}（${Number((revision as { value: string }).value) - 1}回変更）\n`;
+    }
+
+    // コメント履歴
+    if ((comments.comments as unknown[]).length > 0) {
+      text += `\nコメント履歴:\n`;
+      for (const comment of comments.comments as { id: string; text: string; createdAt: string; creator: { name: string } }[]) {
+        text += `  [${comment.createdAt}] ${comment.creator?.name ?? "?"}: ${comment.text}\n`;
+      }
+    } else {
+      text += `\nコメント: なし\n`;
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- CSVエクスポート ---
+server.tool(
+  "export_csv",
+  "kintoneのレコードをCSV形式で出力する。検索結果をファイルに保存するか、テキストとして返す。「このアプリのデータをCSVでエクスポートして」等に使う",
+  {
+    app_id: z.number().describe("アプリID"),
+    query: z.string().optional().describe("絞り込みクエリ"),
+    fields: z.array(z.string()).optional().describe("出力するフィールドコードの配列（省略時は全フィールド）"),
+    save_path: z.string().optional().describe("保存先ファイルパス（省略時はテキストとして返す）"),
+    encoding: z.enum(["utf8", "sjis"]).optional().default("utf8").describe("文字エンコーディング"),
+  },
+  async ({ app_id, query, fields, save_path, encoding }) => {
+    // フィールド情報を取得
+    const fieldsResult = await client.getFormFields(app_id);
+    const allFieldCodes = Object.keys(fieldsResult.properties);
+    const outputFields = fields ?? allFieldCodes;
+
+    // ラベル行を作成
+    const labels = outputFields.map(code => {
+      const prop = fieldsResult.properties[code] as Record<string, unknown> | undefined;
+      return (prop?.label as string) ?? code;
+    });
+
+    // レコード取得
+    const records = await client.getAllRecords(app_id, query, outputFields);
+
+    // CSV生成
+    const escapeCSV = (val: string): string => {
+      if (val.includes(",") || val.includes('"') || val.includes("\n")) {
+        return `"${val.replace(/"/g, '""')}"`;
+      }
+      return val;
+    };
+
+    const lines: string[] = [];
+    lines.push(labels.map(l => escapeCSV(l)).join(","));
+
+    for (const record of records) {
+      const row = outputFields.map(code => {
+        const field = record[code];
+        if (!field) return "";
+        const value = field.value;
+        if (value === null || value === undefined) return "";
+        if (Array.isArray(value)) {
+          // 配列型（チェックボックス、ユーザー選択等）
+          return escapeCSV(value.map(v => typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)).join(";"));
+        }
+        if (typeof value === "object") {
+          return escapeCSV(JSON.stringify(value));
+        }
+        return escapeCSV(String(value));
+      });
+      lines.push(row.join(","));
+    }
+
+    const csvContent = lines.join("\n");
+
+    if (save_path) {
+      const fs = await import("fs");
+      if (encoding === "sjis") {
+        // Shift_JISは非対応（Node.jsネイティブでは難しい）のでUTF-8 BOM付きで保存
+        const bom = Buffer.from([0xEF, 0xBB, 0xBF]);
+        const content = Buffer.from(csvContent, "utf-8");
+        fs.writeFileSync(save_path, Buffer.concat([bom, content]));
+      } else {
+        const bom = Buffer.from([0xEF, 0xBB, 0xBF]);
+        const content = Buffer.from(csvContent, "utf-8");
+        fs.writeFileSync(save_path, Buffer.concat([bom, content]));
+      }
+      return {
+        content: [{ type: "text" as const, text: `CSV出力完了: ${save_path}\n${records.length}件のレコードをエクスポートしました` }],
+      };
+    }
+
+    return {
+      content: [{ type: "text" as const, text: `CSV出力（${records.length}件）:\n\n${csvContent}` }],
+    };
+  }
+);
+
 // --- サーバー起動 ---
 async function main() {
   const transport = new StdioServerTransport();
