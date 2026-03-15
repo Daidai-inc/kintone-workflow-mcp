@@ -36,6 +36,21 @@ function createClient(): KintoneClient {
 
 const client = createClient();
 
+/** デプロイ完了を待つ共通ヘルパー（最大30秒） */
+async function waitForDeploy(appId: number): Promise<string> {
+  for (let i = 0; i < 15; i++) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const status = await client.getDeployStatus([appId]);
+    if (status.apps[0]?.status === "SUCCESS") {
+      return "デプロイ完了";
+    }
+    if (status.apps[0]?.status === "FAIL") {
+      return "デプロイ失敗。手動で確認してください。";
+    }
+  }
+  return "デプロイタイムアウト（30秒）。手動で確認してください。";
+}
+
 const server = new McpServer({
   name: "kintone-workflow-mcp",
   version: "0.1.0",
@@ -314,10 +329,10 @@ server.tool(
   "cross_app_lookup",
   "2つのkintoneアプリを横断して検索する。アプリAのレコードに紐づくアプリBのレコードを取得する。「案件アプリの顧客に紐づく請求書を全部出して」等に使う",
   {
-    source_app_id: z.number().describe("検索元アプリID（例: 案件管理）"),
+    source_app_id: z.number().int().positive().describe("検索元アプリID（例: 案件管理）"),
     source_query: z.string().optional().describe("検索元の絞り込みクエリ"),
     source_key_field: z.string().describe("検索元の結合キーフィールドコード（例: '顧客名'）"),
-    target_app_id: z.number().describe("検索先アプリID（例: 請求書）"),
+    target_app_id: z.number().int().positive().describe("検索先アプリID（例: 請求書）"),
     target_key_field: z.string().describe("検索先の結合キーフィールドコード（例: '顧客名'）"),
     target_fields: z.array(z.string()).optional().describe("検索先から取得するフィールド"),
   },
@@ -408,18 +423,11 @@ server.tool(
     // デプロイ
     if (deploy) {
       await client.deployApp(appId);
-      // デプロイ完了を待つ（最大30秒）
-      for (let i = 0; i < 15; i++) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const status = await client.getDeployStatus([appId]);
-        if (status.apps[0]?.status === "SUCCESS") {
-          result += `デプロイ完了。アプリURL: ${client["baseUrl"]}/k/${appId}/\n`;
-          break;
-        }
-        if (status.apps[0]?.status === "FAIL") {
-          result += `デプロイ失敗。手動で確認してください。\n`;
-          break;
-        }
+      const deployResult = await waitForDeploy(appId);
+      if (deployResult === "デプロイ完了") {
+        result += `デプロイ完了。アプリURL: ${client["baseUrl"]}/k/${appId}/\n`;
+      } else {
+        result += `${deployResult}\n`;
       }
     }
 
@@ -574,7 +582,7 @@ server.tool(
   "execute_workflow",
   "複数のkintone操作を連鎖して実行する。「未対応案件を検索→担当者にリマインドコメント→ステータス更新」等の複合操作を1回で実行。",
   {
-    app_id: z.number().describe("対象アプリID"),
+    app_id: z.number().int().positive().describe("対象アプリID"),
     search_query: z.string().describe("対象レコードを絞り込むクエリ"),
     actions: z.array(z.object({
       type: z.enum(["comment", "update_field", "update_status"]).describe("アクションの種類"),
@@ -704,18 +712,7 @@ server.tool(
 
     if (deploy) {
       await client.deployApp(app_id);
-      for (let i = 0; i < 15; i++) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const status = await client.getDeployStatus([app_id]);
-        if (status.apps[0]?.status === "SUCCESS") {
-          text += "\nデプロイ完了";
-          break;
-        }
-        if (status.apps[0]?.status === "FAIL") {
-          text += "\nデプロイ失敗。手動で確認してください。";
-          break;
-        }
-      }
+      text += `\n${await waitForDeploy(app_id)}`;
     }
 
     return { content: [{ type: "text" as const, text }] };
@@ -737,18 +734,7 @@ server.tool(
 
     if (deploy) {
       await client.deployApp(app_id);
-      for (let i = 0; i < 15; i++) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const status = await client.getDeployStatus([app_id]);
-        if (status.apps[0]?.status === "SUCCESS") {
-          text += "\nデプロイ完了";
-          break;
-        }
-        if (status.apps[0]?.status === "FAIL") {
-          text += "\nデプロイ失敗。手動で確認してください。";
-          break;
-        }
-      }
+      text += `\n${await waitForDeploy(app_id)}`;
     }
 
     return { content: [{ type: "text" as const, text }] };
@@ -811,18 +797,7 @@ server.tool(
 
     if (deploy) {
       await client.deployApp(app_id);
-      for (let i = 0; i < 15; i++) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const status = await client.getDeployStatus([app_id]);
-        if (status.apps[0]?.status === "SUCCESS") {
-          text += "\nデプロイ完了";
-          break;
-        }
-        if (status.apps[0]?.status === "FAIL") {
-          text += "\nデプロイ失敗。手動で確認してください。";
-          break;
-        }
-      }
+      text += `\n${await waitForDeploy(app_id)}`;
     }
 
     return { content: [{ type: "text" as const, text }] };
@@ -1226,6 +1201,230 @@ server.tool(
   }
 );
 
+// --- レコードACL更新 ---
+server.tool(
+  "update_record_permissions",
+  "kintoneアプリのレコード単位のアクセス権限を更新する（プレビュー環境に反映）",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+    rights: z.array(z.record(z.string(), z.unknown())).describe("レコードACL設定の配列"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, rights, deploy }) => {
+    const result = await client.updateRecordAcl(app_id, rights);
+    let text = `レコードACL更新完了（revision: ${result.revision}）`;
+    if (deploy) {
+      await client.deployApp(app_id);
+      text += `\n${await waitForDeploy(app_id)}`;
+    }
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- フィールドACL更新 ---
+server.tool(
+  "update_field_permissions",
+  "kintoneアプリのフィールド単位のアクセス権限を更新する（プレビュー環境に反映）",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+    rights: z.array(z.record(z.string(), z.unknown())).describe("フィールドACL設定の配列"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, rights, deploy }) => {
+    const result = await client.updateFieldAcl(app_id, rights);
+    let text = `フィールドACL更新完了（revision: ${result.revision}）`;
+    if (deploy) {
+      await client.deployApp(app_id);
+      text += `\n${await waitForDeploy(app_id)}`;
+    }
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- フォームレイアウト取得 ---
+server.tool(
+  "get_form_layout",
+  "kintoneアプリのフォームレイアウト（フィールド配置）を取得する",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+  },
+  async ({ app_id }) => {
+    const result = await client.getFormLayout(app_id);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result.layout, null, 2) }],
+    };
+  }
+);
+
+// --- フォームレイアウト更新 ---
+server.tool(
+  "update_form_layout",
+  "kintoneアプリのフォームレイアウト（フィールド配置）を更新する（プレビュー環境に反映）",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+    layout: z.array(z.record(z.string(), z.unknown())).describe("レイアウト定義の配列"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, layout, deploy }) => {
+    const result = await client.updateFormLayout(app_id, layout);
+    let text = `フォームレイアウト更新完了（revision: ${result.revision}）`;
+    if (deploy) {
+      await client.deployApp(app_id);
+      text += `\n${await waitForDeploy(app_id)}`;
+    }
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- ビュー更新 ---
+server.tool(
+  "update_view",
+  "kintoneアプリの既存ビューの設定を変更する（フィルタ条件、表示フィールド、ソート順等）",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+    name: z.string().describe("更新するビュー名"),
+    fields: z.array(z.string()).optional().describe("表示するフィールドコードの配列"),
+    filter_cond: z.string().optional().describe("フィルタ条件（kintoneクエリ構文）"),
+    sort: z.string().optional().describe("ソート条件（例: '更新日時 desc'）"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, name, fields, filter_cond, sort, deploy }) => {
+    // 既存ビューを取得して対象ビューの設定をマージ
+    const existing = await client.getViews(app_id);
+    const existingViews = existing.views as Record<string, Record<string, unknown>>;
+    const targetView = existingViews[name];
+    if (!targetView) {
+      return { content: [{ type: "text" as const, text: `ビュー「${name}」が見つかりません` }] };
+    }
+
+    const viewDef: Record<string, unknown> = { ...targetView };
+    if (fields) viewDef.fields = fields;
+    if (filter_cond !== undefined) viewDef.filterCond = filter_cond;
+    if (sort !== undefined) viewDef.sort = sort;
+
+    const result = await client.updateViews(app_id, { [name]: viewDef });
+    let text = `ビュー「${name}」を更新しました（revision: ${result.revision}）`;
+
+    if (deploy) {
+      await client.deployApp(app_id);
+      text += `\n${await waitForDeploy(app_id)}`;
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- ビュー削除 ---
+server.tool(
+  "delete_view",
+  "kintoneアプリのビューを削除する。注意: 削除すると元に戻せない",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+    name: z.string().describe("削除するビュー名"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, name, deploy }) => {
+    // 既存ビューを取得して対象を除外した全ビューをセット
+    const existing = await client.getViews(app_id);
+    const existingViews = existing.views as Record<string, Record<string, unknown>>;
+    if (!existingViews[name]) {
+      return { content: [{ type: "text" as const, text: `ビュー「${name}」が見つかりません` }] };
+    }
+
+    // 対象ビューを除外して残りのビューだけで更新
+    const remainingViews: Record<string, Record<string, unknown>> = {};
+    for (const [viewName, viewDef] of Object.entries(existingViews)) {
+      if (viewName !== name) {
+        remainingViews[viewName] = viewDef;
+      }
+    }
+
+    const result = await client.updateViews(app_id, remainingViews);
+    let text = `ビュー「${name}」を削除しました（revision: ${result.revision}）`;
+
+    if (deploy) {
+      await client.deployApp(app_id);
+      text += `\n${await waitForDeploy(app_id)}`;
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- アプリコピー ---
+server.tool(
+  "copy_app",
+  "既存のkintoneアプリをコピーして新しいアプリを作成する。フィールド定義やビュー設定がコピーされる",
+  {
+    original_app_id: z.number().int().positive().describe("コピー元アプリID"),
+    name: z.string().describe("新しいアプリ名"),
+    deploy: z.boolean().optional().default(true).describe("作成後に自動デプロイするか"),
+  },
+  async ({ original_app_id, name, deploy }) => {
+    const result = await client.copyApp(original_app_id, name);
+    const appId = Number(result.app);
+    let text = `アプリ「${name}」をコピー作成しました（ID: ${appId}、コピー元: ${original_app_id}）`;
+
+    if (deploy) {
+      await client.deployApp(appId);
+      const deployResult = await waitForDeploy(appId);
+      if (deployResult === "デプロイ完了") {
+        text += `\nデプロイ完了。アプリURL: ${client["baseUrl"]}/k/${appId}/`;
+      } else {
+        text += `\n${deployResult}`;
+      }
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- プロセス管理設定更新 ---
+server.tool(
+  "update_process_settings",
+  "kintoneアプリのプロセス管理（ワークフロー）設定を更新する。ステータス、遷移条件、作業者を変更できる（プレビュー環境に反映）",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+    enable: z.boolean().optional().describe("プロセス管理の有効/無効"),
+    states: z.record(z.string(), z.record(z.string(), z.unknown())).optional().describe("ステータス定義"),
+    actions: z.array(z.record(z.string(), z.unknown())).optional().describe("アクション定義"),
+    deploy: z.boolean().optional().default(true).describe("変更後に自動デプロイするか"),
+  },
+  async ({ app_id, enable, states, actions, deploy }) => {
+    const settings: Record<string, unknown> = {};
+    if (enable !== undefined) settings.enable = enable;
+    if (states) settings.states = states;
+    if (actions) settings.actions = actions;
+
+    const result = await client.updateProcessStatus(app_id, settings);
+    let text = `プロセス管理設定更新完了（revision: ${result.revision}）`;
+
+    if (deploy) {
+      await client.deployApp(app_id);
+      text += `\n${await waitForDeploy(app_id)}`;
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  }
+);
+
+// --- コメント削除 ---
+server.tool(
+  "delete_comment",
+  "kintoneレコードのコメントを削除する",
+  {
+    app_id: z.number().int().positive().describe("アプリID"),
+    record_id: z.number().int().positive().describe("レコードID"),
+    comment_id: z.number().int().positive().describe("コメントID"),
+  },
+  async ({ app_id, record_id, comment_id }) => {
+    await client.deleteComment(app_id, record_id, comment_id);
+    return {
+      content: [{ type: "text" as const, text: `コメント削除完了: comment_id=${comment_id}` }],
+    };
+  }
+);
+
 // --- サーバー起動 ---
 async function main() {
   const transport = new StdioServerTransport();
@@ -1233,12 +1432,13 @@ async function main() {
   console.error("kintone-workflow-mcp server started");
 
   // Graceful shutdown
-  const shutdown = () => {
+  const shutdown = async () => {
     console.error("kintone-workflow-mcp server shutting down...");
+    await server.close();
     process.exit(0);
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => { void shutdown(); });
+  process.on("SIGINT", () => { void shutdown(); });
 }
 
 main().catch((error) => {

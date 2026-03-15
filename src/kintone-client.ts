@@ -284,10 +284,10 @@ export class KintoneClient {
 
   /** ファイルアップロード（multipart/form-data） */
   async uploadFile(filePath: string, fileName?: string): Promise<{ fileKey: string }> {
-    const fs = await import("fs");
-    const path = await import("path");
-    const actualFileName = fileName ?? path.basename(filePath);
-    const fileData = fs.readFileSync(filePath);
+    const fsModule = await import("fs");
+    const pathModule = await import("path");
+    const actualFileName = fileName ?? pathModule.basename(filePath);
+    const fileData = fsModule.readFileSync(filePath);
     const blob = new Blob([fileData]);
 
     const formData = new FormData();
@@ -302,11 +302,26 @@ export class KintoneClient {
       }
     }
 
+    const reqId = crypto.randomUUID();
+    const startTime = Date.now();
     const response = await fetch(url, {
       method: "POST",
       headers,
       body: formData,
     });
+    const elapsed = Date.now() - startTime;
+    console.error(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        request_id: reqId,
+        level: response.ok ? "info" : "error",
+        method: "POST",
+        path: "/k/v1/file.json",
+        status: response.status,
+        elapsed_ms: elapsed,
+        file_name: actualFileName,
+      })
+    );
     if (!response.ok) {
       const errorBody = await response.text();
       throw new Error(`kintone API error: ${response.status} ${response.statusText}\n${errorBody}`);
@@ -320,7 +335,21 @@ export class KintoneClient {
     const headers = { ...this.headers };
     delete headers["Content-Type"];
 
+    const reqId = crypto.randomUUID();
+    const startTime = Date.now();
     const response = await fetch(url, { method: "GET", headers });
+    const elapsed = Date.now() - startTime;
+    console.error(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        request_id: reqId,
+        level: response.ok ? "info" : "error",
+        method: "GET",
+        path: "/k/v1/file.json",
+        status: response.status,
+        elapsed_ms: elapsed,
+      })
+    );
     if (!response.ok) {
       const errorBody = await response.text();
       throw new Error(`kintone API error: ${response.status} ${response.statusText}\n${errorBody}`);
@@ -402,10 +431,28 @@ export class KintoneClient {
     return res as { rights: unknown[] };
   }
 
+  /** レコードのアクセス権限更新（プレビュー環境） */
+  async updateRecordAcl(appId: number, rights: unknown[]): Promise<{ revision: string }> {
+    const res = await this.request("PUT", "/k/v1/preview/record/acl.json", {
+      app: appId,
+      rights,
+    });
+    return res as { revision: string };
+  }
+
   /** フィールドのアクセス権限取得 */
   async getFieldAcl(appId: number): Promise<{ rights: unknown[] }> {
     const res = await this.request("GET", `/k/v1/field/acl.json?app=${appId}`);
     return res as { rights: unknown[] };
+  }
+
+  /** フィールドのアクセス権限更新（プレビュー環境） */
+  async updateFieldAcl(appId: number, rights: unknown[]): Promise<{ revision: string }> {
+    const res = await this.request("PUT", "/k/v1/preview/field/acl.json", {
+      app: appId,
+      rights,
+    });
+    return res as { revision: string };
   }
 
   // --- ユーザー/グループ/組織（Cybozu User API） ---
@@ -480,6 +527,49 @@ export class KintoneClient {
   async getProcessStatus(appId: number): Promise<Record<string, unknown>> {
     const res = await this.request("GET", `/k/v1/app/status.json?app=${appId}`);
     return res;
+  }
+
+  /** プロセス管理設定更新（プレビュー環境） */
+  async updateProcessStatus(appId: number, settings: Record<string, unknown>): Promise<{ revision: string }> {
+    const res = await this.request("PUT", "/k/v1/preview/app/status.json", {
+      app: appId,
+      ...settings,
+    });
+    return res as { revision: string };
+  }
+
+  /** フォームレイアウト取得 */
+  async getFormLayout(appId: number): Promise<{ layout: unknown[] }> {
+    const res = await this.request("GET", `/k/v1/app/form/layout.json?app=${appId}`);
+    return res as { layout: unknown[] };
+  }
+
+  /** フォームレイアウト更新（プレビュー環境） */
+  async updateFormLayout(appId: number, layout: unknown[]): Promise<{ revision: string }> {
+    const res = await this.request("PUT", "/k/v1/preview/app/form/layout.json", {
+      app: appId,
+      layout,
+    });
+    return res as { revision: string };
+  }
+
+  /** アプリコピー */
+  async copyApp(originalAppId: number, name: string): Promise<{ app: string; revision: string }> {
+    const res = await this.request("POST", "/k/v1/app.json", {
+      name,
+      originalAppId,
+    });
+    return res as { app: string; revision: string };
+  }
+
+  /** コメント削除 */
+  async deleteComment(appId: number, recordId: number, commentId: number): Promise<Record<string, never>> {
+    const res = await this.request("DELETE", "/k/v1/record/comment.json", {
+      app: appId,
+      record: recordId,
+      comment: commentId,
+    });
+    return res as Record<string, never>;
   }
 
   /** 作業者変更 */
